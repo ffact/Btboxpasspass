@@ -2,6 +2,6 @@ version: 1
 services:
   web:
     image: python:3.10
-    command: python main.py
+    command: python terabox.py --help
     envs:
       RAILWAY: "true"
