@@ -456,13 +456,17 @@ def cmd_download(args):
                         continue
                     secs = time.monotonic() - t0
                     rate = got / secs / (1024 * 1024)
-                    verdict = "SUCCESS" if rate >= 1.0 else "FAILURE (< 1 MB/s)"
+                    # The 1 MB/s rule only applies to bulk files; tiny files are
+                    # latency-bound, so judge them by integrity alone.
+                    bulk = int(expected or got) > 1024 * 1024
+                    verdict = ("SUCCESS" if rate >= 1.0 else "FAILURE (< 1 MB/s)") \
+                        if bulk else "SUCCESS (small file)"
                     if expected and int(got) < int(expected):
                         print(f"✗ {name}: incomplete ({got}/{expected} bytes)")
                         overall_ok = False
                     else:
                         print(f"✓ {name}: {got} bytes in {secs:.1f}s = {rate:.2f} MB/s -> {verdict}")
-                        if rate < 1.0:
+                        if bulk and rate < 1.0:
                             overall_ok = False
         return overall_ok
 
