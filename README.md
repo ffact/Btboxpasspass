@@ -1,120 +1,70 @@
-<div style="text-align:center" align="center">
-  <img src="./images/bot.jpg" alt="Bot Logo" width="300"/>
-</div>
+# TeraBox Link Bypass — standalone CLI 🚀
 
-# TeraBox Link Bypass Bot 🚀
+Single-file command-line tool (`terabox.py`) that resolves TeraBox share links
+into direct download links and can download the files while measuring speed.
+No environment variables — everything is passed via flags or a local config
+file (`./terabox.json`).
 
----
+Install deps: `pip install aiohttp`
 
-### **Description:**
-The *TeraBox Link Bypass Bot* is a sophisticated Telegram bot crafted to seamlessly bypass download links from the TeraBox file hosting service. Users can send TeraBox links to the bot, and it will elegantly provide direct download links along with comprehensive information about the file.
+## Commands
 
----
+```bash
+python terabox.py --help                       # usage overview
 
-### **Features:**
+# one-time setup (asks for the cookie source, saves ./terabox.json)
+python terabox.py configure
+python terabox.py configure --cookies cookies.txt   # non-interactive
 
-1. **Start Command:**
-   - `/start`: Initiates communication with the bot, presenting users with a refined introduction and clear usage instructions.
+# bypass link(s) straight from the shell
+python terabox.py bypass https://1024terabox.com/s/1AbC
+cat links.txt | python terabox.py bypass -          # stdin / file paths work too
+python terabox.py bypass --quiet <url>              # only the direct dlinks
+python terabox.py bypass --json  <url>              # machine-readable output
+python terabox.py bypass --cookies cookies.txt <url>  # ad-hoc cookie override
 
-2. **Ping Command:**
-   - `/ping`: Allows the distinguished bot owner to assess its responsiveness and latency with a touch of professionalism.
+# download the shared file(s) and report throughput
+# (SUCCESS if >= 1 MB/s, FAILURE + exit code 1 otherwise)
+python terabox.py download --cookies cookies.txt -o ./out <url>
 
-3. **Link Handling:**
-   - Automatically detects TeraBox links in messages, ensuring a polished user experience.
-   - Validates URLs, fetching direct download links with a commitment to precision.
-   - Presents file details such as title, size, and download link in a structured and professional manner.
+# validate a cookie file (txt or json); exit 0 = compliant
+python terabox.py check-cookies cookies.txt
+```
 
-4. **Access Control:**
-   - Restricts usage to private chats or specified groups, prioritizing privacy and controlled access.
-   - Issues a courteous warning when accessed from unauthorized groups.
+## Cookie sources (auto-detected format)
 
----
+The `--cookies` flag or the `cookies` entry in `terabox.json` accepts any of:
 
-### **Commands:**
+* **Netscape/curl `.txt`** files (tab- or space-separated, e.g. exported with
+  "Get cookies.txt" extensions or `curl --cookie-jar`)
+* **JSON browser exports** (Firefox storage-inspector nested maps,
+  EditThisCookie arrays, lists of cookie objects). A top-level `userAgent`
+  field is applied as the request User-Agent.
+* Inline dict text (`{"ndus": "...", "browserid": "..."}`)
+* Raw header strings (`name=value; name2=value2`)
 
-1. **/start:**
-   - Invokes a welcome message with clear instructions, setting the tone for user engagement.
+Non-TeraBox cookies (Google `_ga`, `__Secure-*`, etc.) are filtered out
+automatically. The important cookies are `ndus` and `browserid` —
+`check-cookies` verifies their presence and expiry.
 
-2. **/ping:**
-   - Empowers the bot owner with the ability to gauge responsiveness and latency in a refined manner.
+## Config file
 
----
+`./terabox.json` (override path with `-c/--config`):
 
-### **How to Use:**
+```json
+{ "cookies": "cookies.txt" }
+```
 
-1. **Start a Chat:**
-   - Initiate a private chat with the bot, ensuring a discreet and personalized experience.
+Flag values always win over the config file; the config file is optional.
 
-2. **Send TeraBox Links:**
-   - Share TeraBox links with the bot, guaranteeing a streamlined interaction.
+## Exit codes
 
-3. **Receive Download Links:**
-   - Experience the bot's efficiency as it provides direct download links and comprehensive file information.
+| Command | 0 | 1 |
+|---|---|---|
+| `bypass` | all URLs resolved | at least one failed |
+| `download` | every file downloaded at ≥ 1 MB/s | failure or slow (< 1 MB/s) |
+| `check-cookies` | compliant (ndus+browserid, unexpired) | missing/expired/unparseable |
 
----
+## Disclaimer
 
-### **Additional Information:**
-
-- **Bot Link:**
-  - Telegram Username: [Terabox Bypass](https://t.me/badbakabot)
-
-- **Forbidden Access:**
-  - Groups not listed in the `allowed_groups` variable will receive a polite warning.
-
-- **Error Handling:**
-  - Displays an informative error message if there are issues with link processing, maintaining transparency.
-
----
-
-### **More Information:**
-
-- **Dependencies:**
-  - Install necessary Python libraries using `pip install -r requirements.txt`.
-
-- **Customization:**
-  - Adjust the `allowed_groups` variable for precise group access control.
-  - Tailor the error messages or other text as needed, ensuring a polished user interface.
-
-- **Disclaimer:**
-  - This bot is intended for educational and personal use only, upholding the highest standards of ethical use.
-
----
-
-### **How to Run:**
-
-1. **Install Dependencies:**
-   - Execute `pip install -r requirements.txt` to install the required Python libraries.
-
-2. **Run the Bot:**
-   - Execute the script, ensuring a smooth and reliable operation.
-
-3. **Enjoy:**
-   - Embark on a seamless journey with the bot to bypass TeraBox links and download files effortlessly.
-
----
-## Deployment
-Deployment is easy, you can deploy Terabox Bypass on Heroku or Railway.
-1. Fork this repository.
-2. In environment variable section, add the following variables:
-   - `API_ID` : Get it from [my.telegram.org](https://my.telegram.org).
-   - `API_HASH` : Get it from [my.telegram.org](https://my.telegram.org).
-   - `BOT_TOKEN` : Get it from [@BotFather](https://t.me/BotFather).
-   - `SESSION_STRING` : Get it from [![Run on Repl.it](https://replit.com/badge/github/bakamono12/GhostForwarder)](https://replit.com/@baka1432/PyroGramAuth).
-   - `owner_id` : Your Telegram ID.[Get it from here](https://t.me/userinfobot)
-   - `allowed_groups` : ID of groups where the bot should work(with square `[]` brackets). eg:- ["-12323xxxx"] or ["1212xxx", "1236xxx"]
-   - `MY_COOKIES` : Get it from [here](https://www.terabox.com/user/login).
-   - `MY_HEADERS` : Get it from [here](https://www.terabox.com/user/login).
-   - `HELP VIDEO FOR TERABOX`: [![Watch the video](./images/play-button.svg)](https://github.com/r0ld3x/terabox-downloader-bot/issues/2#issuecomment-1856180595) credits to [@r0ld3x](https://github.com/r0ld3x)
-3. [![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/template/_l3iQY?referralCode=IEUhZ-)
-   - [![Deploy](https://www.herokucdn.com/deploy/button.svg)](https://heroku.com/deploy)
-4. And Fill in the VARS obtained from step 2
-5. Click on Deploy.
-6. Restart the app and enjoy.
-7. To check if app is live or not, use `/ping` command in Chat.
-
----
-### **Contributors:**
-
-- **Bot Developer:**
-  - [baka](https://t.me/DTMK_C)
-
+Intended for educational and personal use only.
