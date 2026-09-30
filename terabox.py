@@ -231,12 +231,16 @@ async def fetch_download_links(session, url):
         out = []
         for top in files:
             if str(top.get("isdir")) == "1":
+                fname = top.get("server_filename") or "folder"
                 await _walk_share(session, list_url, base, final_url,
-                                  top.get("path", "/" + (top.get("server_filename") or "")),
-                                  "", 0, out)
+                                  top.get("path", "/" + fname),
+                                  fname + "/", 0, out)   # prefix keeps folder name
             elif top.get("dlink"):
+                top["_relpath"] = top.get("_relpath") or top.get("server_filename")
                 out.append(top)
         return out
+    for f in files:  # plain-file share: no folder prefix
+        f.setdefault("_relpath", f.get("server_filename") or "file")
     return files
 
 
@@ -426,6 +430,9 @@ def cmd_download(args):
                         print(f"! Skipping {name} (folder or no direct link)")
                         continue
                     subdir = os.path.dirname(rel)
+                    # outdir already carries the top folder name; don't double it
+                    if subdir.split("/")[0] == os.path.basename(outdir):
+                        subdir = subdir.split("/", 1)[1] if "/" in subdir else ""
                     filedir = os.path.join(outdir, subdir) if subdir else outdir
                     os.makedirs(filedir, exist_ok=True)
                     dest = os.path.join(filedir, name)
