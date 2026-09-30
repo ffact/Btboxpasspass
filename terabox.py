@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """TeraBox Link Bypass — standalone single-file CLI tool. No env vars needed.
 
-All configuration is passed as command-line flags and/or stored in a local
-config file (default: ./terabox.json, created by `configure`).
+Everything is passed as command-line flags; no config files to manage.
 
-Install deps:   pip install aiohttp
+Install deps:   pip install aiohttp          (optional: apt install aria2)
 
 CLI usage:
-    # one-time setup (asks for the cookie source, saves ./terabox.json)
-    python terabox.py configure
-
     # bypass links straight from the shell
     python terabox.py bypass https://terabox.com/s/1AbC https://dubox.com/s/1XyZ
     python terabox.py bypass --cookies cookies.txt <url>... # ad-hoc cookie file
     echo <url> | python terabox.py bypass -                 # read URLs from stdin
     python terabox.py bypass --json <url>                   # machine-readable
     python terabox.py bypass --quiet <url>                  # just the direct links
+
+    # download via aria2c (multi-connection; falls back to plain HTTP if absent)
+    python terabox.py download --cookies cookies.txt <url>...
+    python terabox.py download --connections 8 --min-split-size 1M -o out <url>...
 
     # helpers
     python terabox.py check-cookies FILE   # validate a Netscape/.txt or .json cookie file
@@ -31,18 +31,14 @@ import argparse
 import ast
 import asyncio
 import json
-import logging
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time
 
 import aiohttp
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-logger = logging.getLogger("terabox")
-
-CONFIG_PATH_DEFAULT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "terabox.json")
 
 URL_RE = re.compile(r"https?://\S+")
 TERABOX_HOSTS = re.compile(
@@ -160,85 +156,6 @@ def only_terabox(cookies):
     return {k: v for k, v in cookies.items() if not k.startswith(_DROP_PREFIXES)}
 
 
-# ------------------------------------------------------------------------ config
-
-
-def parse_list(value):
-    """Parse '[-123, 456]' / '["a","b"]' / 'a,b' into a list of strings."""
-    value = (value or "").strip()
-    if not value:
-        return []
-    try:
-        data = json.loads(value)
-    except json.JSONDecodeError:
-        try:
-            data = ast.literal_eval(value)
-        except (ValueError, SyntaxError):
-            data = [p.strip() for p in value.split(",") if p.strip()]
-    if isinstance(data, (list, tuple, set)):
-        return [str(x) for x in data]
-    return [str(data)]
-
-
-def load_config(path):
-    try:
-        with open(path, encoding="utf-8") as fh:
-            cfg = json.load(fh)
-        return cfg if isinstance(cfg, dict) else {}
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-
-def save_config(path, cfg):
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(cfg, fh, indent=2)
-    logger.info("Saved config to %s", path)
-
-
-def ask(prompt, default=None, secret=False):
-    try:
-        import getpass
-        val = getpass.getpass(prompt + ": ") if secret else input(prompt + ": ")
-    except EOFError:
-        val = ""
-    val = val.strip()
-    return val or (default or "")
-
-
-def cmd_configure(args):
-    """Interactively create/update the config file. Flag values win over prompts."""
-    path = args.config
-    cfg = load_config(path)
-    print(f"Configuring {path} (Enter keeps current/default shown in [...]).")
-
-    def pick(name, prompt, flag=None, default="", secret=False):
-        cur = getattr(args, name, None)
-        if cur:                      # explicit flag -> no prompt
-            cfg[name] = cur
-            print(f"  {prompt}: set from flag")
-            return
-        old = cfg.get(name, default)
-        val = ask(f"{prompt}" + (f" [{old[:12] + '...' if secret and old else old}]" if old else ""),
-                  default=old, secret=secret)
-        if val:
-            cfg[name] = val
-
-    pick("cookies", "Cookie file path or JSON/dict text (blank = no cookies)")
-
-    # Normalise cookies once so bad files fail loudly now, not at runtime.
-    if cfg.get("cookies"):
-        cookies, ua = load_cookies(cfg["cookies"])
-        if not cookies:
-            print("  ! Could not parse the cookie source; keeping it anyway.")
-        else:
-            names = ", ".join(sorted(only_terabox(cookies))) or "(all filtered out)"
-            print(f"  Cookies OK ({len(cookies)} parsed; using: {names})"
-                  + (" + userAgent" if ua else ""))
-    save_config(path, cfg)
-    print("Done. Run:  python terabox.py bypass <url>")
-    return 0
-
-
 # -------------------------------------------------------------------- downloader
 
 
@@ -307,13 +224,37 @@ async def fetch_download_links(session, url):
 
     if not files:
         return None
-    # Shared folder: list its contents instead
-    if str(files[0].get("isdir")) == "1":
-        dir_params = {**base, "root": "1", "period": "all", "site_referer": final_url,
-                      "dir": files[0].get("path", ""), "order": "name", "by": "name"}
-        data = await _share_list(session, list_url, dir_params)
-        files = data.get("list")
+    # Shared folder(s): recursively walk the tree and return every file found.
+    # NOTE: sub-directory listings need root=0 AND the folder's real path —
+    # dir=/ or root=1 just echoes the folder entry (or errors errno=2).
+    if any(str(f.get("isdir")) == "1" for f in files):
+        out = []
+        for top in files:
+            if str(top.get("isdir")) == "1":
+                await _walk_share(session, list_url, base, final_url,
+                                  top.get("path", "/" + (top.get("server_filename") or "")),
+                                  "", 0, out)
+            elif top.get("dlink"):
+                out.append(top)
+        return out
     return files
+
+
+async def _walk_share(session, list_url, base, referer, path, prefix, depth, out):
+    """Depth-first listing of one shared folder; appends flat file dicts to out."""
+    params = {**base, "root": "0", "period": "all", "site_referer": referer,
+              "dir": path, "order": "name", "by": "name"}
+    data = await _share_list(session, list_url, params)
+    for e in data.get("list") or []:
+        name = e.get("server_filename") or "file"
+        rel = prefix + name
+        if str(e.get("isdir")) == "1":
+            if depth < 5:
+                await _walk_share(session, list_url, base, referer,
+                                  e.get("path", path + "/" + name), rel + "/", depth + 1, out)
+        elif e.get("dlink"):
+            e["_relpath"] = rel
+            out.append(e)
 
 
 def build_session_args(cookies_source):
@@ -369,10 +310,7 @@ def cmd_bypass(args):
     if not urls:
         sys.exit("No TeraBox URLs given. Example: python terabox.py bypass https://terabox.com/s/1xxxx")
 
-    cfg = load_config(args.config)
-    cookies_source = args.cookies or cfg.get("cookies", "")
-
-    results = asyncio.run(collect_results(urls, cookies_source, args.quiet, args.json))
+    results = asyncio.run(collect_results(urls, args.cookies, args.quiet, args.json))
     return 0 if all(results) else 1
 
 
@@ -405,8 +343,29 @@ async def collect_results(urls, cookies_source, quiet, as_json):
     return ok_flags
 
 
+def aria2_download(dlink, referer, cookie_header, outdir, name,
+                   connections=5, split_size="5M", user_agent=""):
+    """Download one file via aria2c. Returns True on success (file complete)."""
+    aria2c = shutil.which("aria2c")
+    if not aria2c:
+        return None  # signal: aria2 unavailable
+    cmd = [
+        aria2c, "--continue=true", "--auto-file-renaming=false",
+        "--allow-overwrite=true", "--summary-interval=0", "--console-log-level=warn",
+        f"--max-connection-per-server={connections}",
+        f"--min-split-size={split_size}", "--split=16",
+        f"--header=Referer: {referer}",
+        f"--header=Cookie: {cookie_header}",
+    ]
+    if user_agent:
+        cmd.append(f"--header=User-Agent: {user_agent}")
+    cmd += [f"--dir={outdir}", f"--out={name}", dlink.replace("http://", "https://")]
+    proc = subprocess.run(cmd)
+    return proc.returncode == 0 and os.path.isfile(os.path.join(outdir, name))
+
+
 async def download_file(session, dlink, referer, dest):
-    """Stream one dlink to `dest`; returns (bytes_written, seconds)."""
+    """Fallback single-stream HTTP download; returns (bytes_written, seconds)."""
     t0 = time.monotonic()
     got = 0
     url = dlink.replace("http://", "https://")
@@ -425,18 +384,21 @@ async def download_file(session, dlink, referer, dest):
 
 
 def cmd_download(args):
-    """Download the shared file(s) and report throughput; fail under 1 MB/s."""
+    """Resolve share URLs, download via aria2c, report throughput per file."""
     urls = [u for u in read_urls(args.urls) if TERABOX_HOSTS.search(u)]
     if not urls:
         sys.exit("No TeraBox URLs given.")
-    cfg = load_config(args.config)
-    cookies_source = args.cookies or cfg.get("cookies", "")
+    use_aria2 = not args.no_aria2 and shutil.which("aria2c")
+    if not args.no_aria2 and not use_aria2:
+        print("! aria2c not found — falling back to plain HTTP download", file=sys.stderr)
 
     async def run():
         overall_ok = True
-        outdir = args.out or "."
-        os.makedirs(outdir, exist_ok=True)
-        cookies, headers = build_session_args(cookies_source)
+        base_out = args.out or "."
+        os.makedirs(base_out, exist_ok=True)
+        cookies, headers = build_session_args(args.cookies)
+        cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
+        user_agent = headers.get("User-Agent", "")
         jar = aiohttp.CookieJar(unsafe=True)
         async with aiohttp.ClientSession(cookies=cookies, headers=headers,
                                          cookie_jar=jar) as session:
@@ -449,25 +411,52 @@ def cmd_download(args):
                     print(f"✗ {url}: could not bypass (bad link or expired cookie)")
                     overall_ok = False
                     continue
+                # A shared folder gets its own output subdirectory named after it.
+                outdir = base_out
+                folders = sorted({(f.get("_relpath") or "").split("/")[0]
+                                  for f in files if f.get("_relpath")})
+                if len(folders) == 1 and folders[0]:
+                    outdir = os.path.join(base_out, folders[0])
+                    os.makedirs(outdir, exist_ok=True)
                 for f in files:
-                    name = f.get("server_filename") or "file"
+                    rel = f.get("_relpath") or f.get("server_filename") or "file"
+                    name = os.path.basename(rel)
                     dlink = f.get("dlink")
                     if str(f.get("isdir")) == "1" or not dlink:
                         print(f"! Skipping {name} (folder or no direct link)")
                         continue
-                    dest = os.path.join(outdir, name)
-                    print(f"⬇ Downloading {name} ({human_size(f.get('size'))}) -> {dest}")
+                    subdir = os.path.dirname(rel)
+                    filedir = os.path.join(outdir, subdir) if subdir else outdir
+                    os.makedirs(filedir, exist_ok=True)
+                    dest = os.path.join(filedir, name)
+                    expected = f.get("size")
+                    print(f"⬇ Downloading {name} ({human_size(expected)}) -> {dest}"
+                          + (f" [aria2c x{args.connections}]" if use_aria2 else ""))
+                    t0 = time.monotonic()
                     try:
-                        got, secs = await download_file(session, dlink, referer, dest)
+                        done = aria2_download(dlink, referer, cookie_header, filedir, name,
+                                              args.connections, args.min_split_size,
+                                              user_agent) if use_aria2 else None
+                        if done is None:  # no aria2 -> aiohttp fallback
+                            got, _ = await download_file(session, dlink, referer, dest)
+                        elif not done:
+                            raise RuntimeError("aria2c failed (see its output above)")
+                        else:
+                            got = os.path.getsize(dest)
                     except Exception as e:
                         print(f"✗ {name}: download failed: {e}")
                         overall_ok = False
                         continue
+                    secs = time.monotonic() - t0
                     rate = got / secs / (1024 * 1024)
                     verdict = "SUCCESS" if rate >= 1.0 else "FAILURE (< 1 MB/s)"
-                    print(f"✓ {name}: {got} bytes in {secs:.1f}s = {rate:.2f} MB/s -> {verdict}")
-                    if rate < 1.0:
+                    if expected and int(got) < int(expected):
+                        print(f"✗ {name}: incomplete ({got}/{expected} bytes)")
                         overall_ok = False
+                    else:
+                        print(f"✓ {name}: {got} bytes in {secs:.1f}s = {rate:.2f} MB/s -> {verdict}")
+                        if rate < 1.0:
+                            overall_ok = False
         return overall_ok
 
     return 0 if asyncio.run(run()) else 1
@@ -534,32 +523,32 @@ def check_cookies_cmd(args):
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="terabox.py",
-        description="TeraBox link bypass — standalone CLI tool, configured via flags or a config file.",
+        description="TeraBox link bypass — standalone CLI tool, configured via flags only.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__.split("CLI usage:")[1],
     )
-    parser.add_argument("-c", "--config", default=CONFIG_PATH_DEFAULT,
-                        help=f"config file path (default: {CONFIG_PATH_DEFAULT})")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p = sub.add_parser("bypass", aliases=["dl"], help="bypass TeraBox link(s) in the shell")
+    p = sub.add_parser("bypass", help="bypass TeraBox link(s) in the shell")
     p.add_argument("urls", nargs="+",
                    help="TeraBox share URLs, paths to files containing links, or '-' for stdin")
-    p.add_argument("--cookies", help="cookie file/json override for this run")
+    p.add_argument("--cookies", help="cookie file (txt/json), inline JSON/dict, or header string")
     p.add_argument("--json", action="store_true", help="print results as a JSON array")
     p.add_argument("--quiet", action="store_true", help="print only direct download links")
     p.set_defaults(func=cmd_bypass)
 
-    p = sub.add_parser("download", help="actually download the shared file(s) and measure speed")
+    p = sub.add_parser("download", help="download the shared file(s) with aria2c and measure speed")
     p.add_argument("urls", nargs="+",
                    help="TeraBox share URLs, paths to files containing links, or '-' for stdin")
-    p.add_argument("--cookies", help="cookie file/json override for this run")
+    p.add_argument("--cookies", help="cookie file (txt/json), inline JSON/dict, or header string")
     p.add_argument("-o", "--out", default=".", help="output directory (default: .)")
+    p.add_argument("--connections", type=int, default=5, metavar="N",
+                   help="aria2c max connections per server (default: 5)")
+    p.add_argument("--min-split-size", default="5M", metavar="SIZE",
+                   help="aria2c min split size (default: 5M)")
+    p.add_argument("--no-aria2", action="store_true",
+                   help="skip aria2c and use the built-in single-stream downloader")
     p.set_defaults(func=cmd_download)
-
-    p = sub.add_parser("configure", aliases=["config"], help="interactively save settings to the config file")
-    p.add_argument("--cookies")
-    p.set_defaults(func=cmd_configure)
 
     p = sub.add_parser("check-cookies", help="validate a Netscape .txt or JSON cookie file")
     p.add_argument("file"); p.set_defaults(func=check_cookies_cmd)

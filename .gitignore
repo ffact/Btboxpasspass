@@ -1,18 +1,2 @@
-# Python compiled files
 __pycache__/
 *.pyc
-
-# Environment and secrets
-.env
-.env.*
-cookies.txt
-
-# Editor/IDE files
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# OS files
-.DS_Store
-Thumbs.db
