@@ -7,14 +7,10 @@ WORKDIR /app
 # Copy the current directory contents into the container at /app
 COPY . /app
 
-# Install any needed packages specified in requirements.txt
-RUN pip install --no-cache-dir aiohttp
-
-# Make port 80 available to the world outside this container
-EXPOSE 80
-
-# Define environment variable
-ENV NAME World
+# Install deps: python + aria2 (optional multi-connection downloader)
+RUN pip install --no-cache-dir aiohttp && apt-get update \
+    && apt-get install -y --no-install-recommends aria2 && rm -rf /var/lib/apt/lists/*
 
 # Run the CLI when the container launches
-CMD ["python", "terabox.py", "--help"]
+ENTRYPOINT ["python", "terabox.py"]
+CMD ["--help"]

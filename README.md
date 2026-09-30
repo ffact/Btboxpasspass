@@ -2,19 +2,15 @@
 
 Single-file command-line tool (`terabox.py`) that resolves TeraBox share links
 into direct download links and can download the files while measuring speed.
-No environment variables — everything is passed via flags or a local config
-file (`./terabox.json`).
+No environment variables and no config files — everything is passed via flags.
 
-Install deps: `pip install aiohttp`
+Install deps: `pip install aiohttp` (plus optionally `apt install aria2` for
+multi-connection downloads).
 
 ## Commands
 
 ```bash
 python terabox.py --help                       # usage overview
-
-# one-time setup (asks for the cookie source, saves ./terabox.json)
-python terabox.py configure
-python terabox.py configure --cookies cookies.txt   # non-interactive
 
 # bypass link(s) straight from the shell
 python terabox.py bypass https://1024terabox.com/s/1AbC
@@ -23,9 +19,11 @@ python terabox.py bypass --quiet <url>              # only the direct dlinks
 python terabox.py bypass --json  <url>              # machine-readable output
 python terabox.py bypass --cookies cookies.txt <url>  # ad-hoc cookie override
 
-# download the shared file(s) and report throughput
+# download the shared file(s) with aria2c and report throughput
 # (SUCCESS if >= 1 MB/s, FAILURE + exit code 1 otherwise)
 python terabox.py download --cookies cookies.txt -o ./out <url>
+python terabox.py download --connections 8 --min-split-size 1M <url>
+python terabox.py download --no-aria2 <url>         # built-in single-stream fallback
 
 # validate a cookie file (txt or json); exit 0 = compliant
 python terabox.py check-cookies cookies.txt
@@ -33,7 +31,7 @@ python terabox.py check-cookies cookies.txt
 
 ## Cookie sources (auto-detected format)
 
-The `--cookies` flag or the `cookies` entry in `terabox.json` accepts any of:
+The `--cookies` flag accepts any of:
 
 * **Netscape/curl `.txt`** files (tab- or space-separated, e.g. exported with
   "Get cookies.txt" extensions or `curl --cookie-jar`)
@@ -46,16 +44,6 @@ The `--cookies` flag or the `cookies` entry in `terabox.json` accepts any of:
 Non-TeraBox cookies (Google `_ga`, `__Secure-*`, etc.) are filtered out
 automatically. The important cookies are `ndus` and `browserid` —
 `check-cookies` verifies their presence and expiry.
-
-## Config file
-
-`./terabox.json` (override path with `-c/--config`):
-
-```json
-{ "cookies": "cookies.txt" }
-```
-
-Flag values always win over the config file; the config file is optional.
 
 ## Exit codes
 
