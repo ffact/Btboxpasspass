@@ -7,10 +7,11 @@ Single-file TeraBox link bypass + downloader CLI.
 - `pip install aiohttp`
 - Optional: `aria2c` (`apt install aria2`) for multi-connection downloads.
 - **A proxy is mandatory for downloading.** TeraBox throttles residential IPs
-  to a few KB/s — running this script on a residential IP is pointless.
+  to a few KB/s — running this script on a residential IP is pointless. 
   There is no `--proxy` option; route the whole process through one, e.g.:
   `proxychains python terabox.py download <url>`
-- No proxy? Don't use this tool — just use JDownloader or similar.
+  Or run this using col*cough*lab, then copy the files to the drive (google won't like this).
+  You might also want to use JDownloader.
 
 ## Usage
 
