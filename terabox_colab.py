@@ -1,56 +1,56 @@
 #!/usr/bin/env python3
-r"""TeraBox Link Bypass — Google Colab edition.
+r"""TeraBox Link Bypass — command-line edition for a Colab runtime terminal.
 
-Why a notebook? TeraBox triggers its anti-bot / "verify" flow on residential
-IP addresses. Google Colab VMs have plenty of disk space and a datacenter IP
-that TeraBox currently tolerates, so we:
+Why Colab? TeraBox triggers its anti-bot / "verify" flow on residential IP
+addresses. Google Colab VMs have plenty of disk space and a datacenter IP
+that TeraBox currently tolerates. This script is NOT a notebook anymore —
+run it as a normal Python program from the Colab terminal (Runtime → Run
+command), and it performs the whole pipeline in one shot:
 
-  1. resolve the share link(s) into direct dlinks             (resolve cell)
-  2. download the files onto the Colab VM with aria2c         (download cell)
-  3. serve the finished files over a cloudflared quick tunnel
-     and print an aria2 command line whose URLs are the
-     proxified https://<hash>.trycloudflare.com/... links    (serve cell)
+  1. install aria2 + cloudflared if missing
+  2. resolve every share link into direct dlinks
+  3. download ALL resolved files onto the VM with aria2c (x16 connections)
+  4. compress every downloaded file into ONE tar.gz archive
+  5. serve the archive over a cloudflared quick tunnel and print the FINAL
+     aria2c command line whose URL is the proxified archive link
+  6. keep the runtime alive (trivial loop) so Colab doesn't suspend while
+     you pull the archive from your own machine
 
-So the *files end up on Colab*, and you pull them from Colab through the
-Cloudflare tunnel with a ready-made aria2 command.
+USAGE (Colab terminal, or any Linux box):
 
-QUICK START — paste this whole file into ONE Colab cell and Run it once,
-then use follow-up cells:
+    python3 terabox_colab.py "https://terabox.com/s/1AbC" \
+                             "https://dubox.com/s/1XyZ" \
+        --cookies cookies.txt
 
-    # Cell A (setup): installs aria2 + cloudflared binaries
-    setup()
+Cookies may be given as a FILE path or an inline string in ANY supported
+format (Netscape .txt export, EditThisCookie/Firefox JSON, or a raw
+"ndus=..; browserid=.." header string). Non-TeraBox cookies are dropped.
 
-    # Cell B (cookies): paste TeraBox cookies in ANY format (Netscape .txt
-    # export, EditThisCookie/Firefox JSON, or a raw header string).
-    # IMPORTANT: keep the column tabs intact when pasting Netscape files,
-    # or use the JSON export / "ndus=..; browserid=.." header form instead.
-    COOKIES = open("/path/to/uploaded/cookies.txt").read()   # or a triple-quoted paste
-
-    # Cell C (resolve): turn share links into file lists (nothing fetched yet)
-    resolve(["https://terabox.com/s/1AbC", "https://dubox.com/s/1XyZ"], COOKIES)
-
-    # Cell D (download): fetch everything onto the Colab VM (aria2c x16)
-    download_all(outdir="/content/terabox_out")
-
-    # Cell E (serve): launch cloudflared quick tunnel AND print the aria2
-    # command with every file link proxified via trycloudflare.com
-    serve_and_print(outdir="/content/terabox_out")
-
-Cell E prints something like:
+The last line of output looks like:
 
     aria2c -x16 -s16 -k1M --continue=true --auto-file-renaming=false \
-      --out="Movie.mkv" \
-      "https://abc-xyz.trycloudflare.com/content/terabox_out/Movie.mkv"
+      --out="terabox_20260101_120000.tar.gz" \
+      "https://abc-xyz.trycloudflare.com/content/terabox_out/terabox_20260101_120000.tar.gz"
 
 Paste that into your own machine's terminal — your residential IP never
 touches TeraBox at all; it only talks to the (tolerating) Cloudflare edge,
-while Colab does the actual TeraBox fetching.
+while Colab does the actual TeraBox fetching. The script then idles in an
+anti-suspend loop; press Ctrl-C (or stop the cell) when the download is done.
 
-Local smoke test without Colab:  python terabox_colab.py bypass <url>
-(deps: pip install aiohttp)
+Options:
+    --cookies SRC      cookie file path or inline cookie string
+    --outdir DIR       download directory (default /content/terabox_out)
+    --connections N    aria2 connections per server (default 16)
+    --no-archive       skip compression, serve/print each file separately
+    --no-loop          exit right after printing the command (no keep-alive)
+    bypass URL...      legacy mode: only resolve and print JSON
+
+Sub-dependencies: pip install aiohttp
 """
 
+import argparse
 import asyncio
+import glob
 import json
 import os
 import re
@@ -58,6 +58,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tarfile
 import threading
 import time
 import urllib.parse
@@ -429,6 +430,40 @@ def download_all(outdir="/content/terabox_out", connections=16, cookies_source="
     return rc == 0 and ok == len(jobs)
 
 
+# ------------------------------------------------------------------- archive
+
+def make_archive(outdir="/content/terabox_out", files=None, name=None):
+    """Compress every downloaded file into ONE tar.gz next to outdir.
+
+    Works with any number of files (single file or nested folders). Returns
+    the archive path, or None if there is nothing to pack. The archive lives
+    OUTSIDE the scanned tree so it never packs itself.
+    """
+    if files is None:  # everything regular under outdir (multiple downloads)
+        files = [p for p in glob.glob(os.path.join(outdir, "**"), recursive=True)
+                 if os.path.isfile(p)]
+    files = sorted({os.path.abspath(p) for p in files if os.path.isfile(p)})
+    if not files:
+        print("! Nothing to compress — no downloaded files found.")
+        return None
+    if name is None:
+        name = f"terabox_{time.strftime('%Y%m%d_%H%M%S')}.tar.gz"
+    base_dir = os.path.dirname(os.path.abspath(outdir))  # e.g. /content
+    arc = os.path.join(base_dir, name)
+    tmp = arc + ".part"
+    print(f"🗜 Compressing {len(files)} file(s) into {arc} ...")
+    with tarfile.open(tmp, "w:gz") as tf:
+        for p in files:
+            try:
+                arcname = os.path.relpath(p, base_dir)
+            except ValueError:  # different drive roots — fall back to basename
+                arcname = os.path.basename(p)
+            tf.add(p, arcname=arcname)
+    os.replace(tmp, arc)
+    print(f"✅ Archive ready ({human_size(os.path.getsize(arc))}).")
+    return arc
+
+
 # ------------------------------------------------------- tunnel + aria2 output
 
 TUNNEL_PROC = None
@@ -511,13 +546,36 @@ def stop_tunnel():
 
 
 def serve_and_print(outdir="/content/terabox_out", base="/",
-                    connections=16, chunk="1M", dl_dir="./downloaded"):
-    """Start the tunnel and print the aria2 command with proxified file links."""
+                    connections=16, chunk="1M", dl_dir="./downloaded",
+                    archive=None):
+    """Start the tunnel and print the aria2 command with proxified links.
+
+    If `archive` (a tar.gz produced by make_archive) is given, the FINAL
+    command line downloads that single archive instead of every file —
+    one URL for any number of downloaded files.
+    """
     url = start_tunnel(base)
     if not url:
         return None
-    clear_output()
     print(f"✅ Public link: {url}\n")
+
+    if archive:
+        if not os.path.exists(archive):
+            print("! Archive not found:", archive)
+            return None
+        prox = url + "/" + urllib.parse.quote(
+            os.path.abspath(archive).lstrip("/"), safe="/")
+        cmd = (f"aria2c -x{connections} -s{connections} -k{chunk} "
+               f"--continue=true --auto-file-renaming=false "
+               f'--out="{os.path.basename(archive)}" "{prox}"')
+        print("📦 Archive staged on Colab. Run this on YOUR machine:\n")
+        print("-" * 70)
+        print(cmd)
+        print("-" * 70)
+        print("\n💡 Extract with: tar -xzf "
+              f"{os.path.basename(archive)}")
+        print("💡 The tunnel dies when this script/session stops — keep it open.")
+        return cmd
 
     files = []
     for r in RESULTS:
@@ -546,14 +604,41 @@ def serve_and_print(outdir="/content/terabox_out", base="/",
     print("-" * 70)
     print(cmd)
     print("-" * 70)
-    print("\n💡 The tunnel dies when this Colab cell/session stops — keep it open.")
+    print("\n💡 The tunnel dies when this script/session stops — keep it open.")
     return cmd
+
+
+# ------------------------------------------------------------- keep-alive loop
+
+def keep_alive(interval=60):
+    """Trivial loop that keeps the Colab runtime from suspending.
+
+    Colab reclaims idle VMs; a foreground process that periodically produces
+    output counts as activity and buys us time while the user pulls the
+    archive through the tunnel. Ctrl-C ends the session on purpose.
+    """
+    print(f"\n⏳ Keeping runtime alive — press Ctrl-C when your download "
+          f"is done (heartbeat every {interval}s)...")
+    try:
+        n = 0
+        while True:
+            n += 1
+            print(f"[keep-alive] heartbeat #{n} — "
+                  f"{time.strftime('%H:%M:%S')} — tunnel still up."
+                  + (f" {TUNNEL_URL}" if TUNNEL_URL else ""))
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print("\n👋 Keep-alive stopped by user. Shutting down.")
+        stop_tunnel()
 
 
 # ------------------------------------------------------------------------ CLI
 
 def main(argv=None):
-    argv = argv or sys.argv[1:]
+    argv = list(sys.argv[1:] if argv is None else argv)
+
+    # Legacy smoke-test mode: `python terabox_colab.py bypass <url>` prints
+    # the resolved JSON without downloading anything.
     if argv and argv[0] == "bypass":
         urls = [u for u in argv[1:] if not u.startswith("-")]
         cookies = ""
@@ -562,7 +647,62 @@ def main(argv=None):
         resolve(urls, cookies)
         print(json.dumps(RESULTS, indent=2, ensure_ascii=False))
         return 0 if RESULTS else 1
-    print(__doc__)
+
+    ap = argparse.ArgumentParser(
+        prog="terabox_colab.py",
+        description="TeraBox bypass pipeline for a Colab runtime terminal: "
+                    "resolve → download → compress → tunnel → aria2 command.",
+        epilog="Example: python3 terabox_colab.py https://terabox.com/s/1AbC "
+               "--cookies cookies.txt")
+    ap.add_argument("urls", nargs="+", help="one or more TeraBox share links")
+    ap.add_argument("--cookies", default="",
+                    help="cookie file path OR inline cookie string "
+                         "(Netscape/JSON/header, auto-detected)")
+    ap.add_argument("--outdir", default="/content/terabox_out",
+                    help="directory where files are downloaded (default: %(default)s)")
+    ap.add_argument("--connections", type=int, default=16,
+                    help="aria2 connections per server (default: %(default)s)")
+    ap.add_argument("--no-archive", action="store_true",
+                    help="skip compression; serve/print each file separately")
+    ap.add_argument("--no-loop", action="store_true",
+                    help="exit right after printing the final command "
+                         "(no anti-suspend keep-alive loop)")
+    args = ap.parse_args(argv)
+
+    # 1) tooling
+    setup()
+
+    # 2) resolve every share link into direct dlinks
+    try:
+        resolve(args.urls, args.cookies)
+    except ValueError as e:
+        print(f"✗ {e}")
+        return 1
+    if not RESULTS:
+        print("✗ Nothing resolved — check the links/cookies.")
+        return 1
+
+    # 3) download all files onto this machine
+    ok = download_all(outdir=args.outdir, connections=args.connections,
+                      cookies_source=args.cookies)
+    if not ok:
+        print("⚠ Some downloads failed — re-run the same command to resume, "
+              "or continuing with whatever completed...")
+
+    # 4) compress ALL downloaded files into one archive
+    archive = None
+    if not args.no_archive:
+        archive = make_archive(outdir=args.outdir)
+
+    # 5) tunnel + final aria2 command line (uses the archive when present)
+    cmd = serve_and_print(outdir=args.outdir, archive=archive,
+                          connections=args.connections)
+    if cmd is None:
+        return 1
+
+    # 6) trivial loop so the Colab runtime doesn't suspend mid-transfer
+    if not args.no_loop:
+        keep_alive()
     return 0
 
 
