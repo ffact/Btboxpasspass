@@ -370,24 +370,59 @@ def resolve(urls, cookies_source="", quiet=False):
 
 # ------------------------------------------------------------------- download
 
-def download_all(outdir="/content/terabox_out", connections=16, cookies_source=""):
+def _run_aria2(jobs, referer, cookie_header, user_agent, connections,
+               split_size="5M"):
+    """One aria2c invocation whose flags match terabox.py exactly.
+
+    `jobs` is a list of (dlink, dest_path). Every file gets its own
+    URL + --dir/--out pair inside the SAME process, so multiple downloads
+    still work while sharing one Referer/Cookie/UAgent header set — which
+    is what makes terabox.py fast: TeraBox throttles any request whose
+    Referer doesn't match the dlink's originating share page, and sending
+    several Referer headers confuses aria2's header matching.
+    """
+    aria2c = shutil.which("aria2c") or "aria2c"
+    cmd = [
+        aria2c, "--continue=true", "--auto-file-renaming=false",
+        "--allow-overwrite=true", "--summary-interval=0", "--console-log-level=warn",
+        f"--max-connection-per-server={connections}",
+        f"--min-split-size={split_size}", "--split=16",
+        f"--header=Referer: {referer}",
+        f"--header=Cookie: {cookie_header}",
+    ]
+    if user_agent:
+        cmd.append(f"--header=User-Agent: {user_agent}")
+    for dlink, dest in jobs:
+        cmd += [dlink.replace("http://", "https://"),
+                f"--dir={os.path.dirname(dest)}",
+                f"--out={os.path.basename(dest)}"]
+    return subprocess.run(cmd).returncode
+
+
+def download_all(outdir="/content/terabox_out", connections=5, cookies_source="",
+                 split_size="5M"):
     """Download every resolved file onto the Colab VM using aria2c.
 
-    TeraBox ties each dlink to the session that minted it (cookies + IP), so
-    we replay the *same* cookies and Referer through aria2's HTTP headers.
+    Speed-critical details kept identical to terabox.py (the fast version):
+      * ONE Referer header per aria2c run, matched to the share page that
+        minted the dlinks. Files are grouped by their originating result so
+        each group is fetched with its correct Referer.
+      * --max-connection-per-server=5 / --min-split-size=5M defaults; TeraBox
+        caps per-session bandwidth, so blasting 16 connections just triggers
+        per-connection throttling (this was the cause of the slow speeds).
+      * No --file-allocation=none: it forces many tiny seeks/writes on Colab
+        disks and cripples throughput with large split sizes.
     """
     os.makedirs(outdir, exist_ok=True)
-    jobs = []
+    all_jobs = []
     for r in RESULTS:
         for f in r["files"]:
             dest = os.path.join(outdir, f["relpath"])
             os.makedirs(os.path.dirname(dest), exist_ok=True)
-            jobs.append((f["dlink"].replace("http://", "https://"),
-                         dest, f["size"]))
-    if not jobs:
+            all_jobs.append((f["dlink"], dest, f["size"]))
+    if not all_jobs:
         print("! Nothing to download — run resolve(...) first.")
         return False
-    referers = [r.get("referer") or r.get("url") or "" for r in RESULTS]
 
     cookies, hdrs = build_session_args(cookies_source)
     cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
@@ -395,39 +430,35 @@ def download_all(outdir="/content/terabox_out", connections=16, cookies_source="
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " \
         "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 
-    # NOTE: aria2's --input-file parser splits option lines on *whitespace*,
-    # so paths/filenames containing spaces cannot be expressed there. Build
-    # the command with explicit per-file URL + --dir/--out pairs instead
-    # (passed as one argv entry each -> no shell quoting issues).
-    cmd = ["aria2c",
-           f"--max-connection-per-server={connections}", "--split=16",
-           "--min-split-size=1M", "--continue=true",
-           "--auto-file-renaming=false", "--allow-overwrite=true",
-           "--file-allocation=none", "--summary-interval=30",
-           "--console-log-level=warn",
-           f"--header=User-Agent: {user_agent}"]
-    for ref in dict.fromkeys(referers):  # one Referer header per distinct share
-        if ref:
-            cmd.append(f"--header=Referer: {ref}")
-    if cookie_header:
-        cmd.append(f"--header=Cookie: {cookie_header}")
-    for dlink, dest, _ in jobs:
-        cmd += [dlink,
-                f"--dir={os.path.dirname(dest)}",
-                f"--out={os.path.basename(dest)}"]
-    print(f"⬇ Downloading {len(jobs)} file(s) to {outdir} ...")
-    rc = subprocess.run(cmd).returncode
+    rc = 0
+    # Group jobs by their originating share so each aria2c run carries the
+    # single correct Referer (multi-file downloads stay supported).
+    for r in RESULTS:
+        jobs = [(f["dlink"], os.path.join(outdir, f["relpath"]))
+                for f in r["files"]]
+        if not jobs:
+            continue
+        referer = r.get("referer") or r.get("url") or ""
+        print(f"⬇ Downloading {len(jobs)} file(s) from {r['url']} "
+              f"[aria2c x{connections}] to {outdir} ...")
+        t0 = time.monotonic()
+        rc |= _run_aria2(jobs, referer, cookie_header, user_agent,
+                         connections, split_size)
+        got_bytes = sum(os.path.getsize(d) for _, d in jobs if os.path.exists(d))
+        secs = max(time.monotonic() - t0, 0.01)
+        print(f"   → {human_size(got_bytes)} in {secs:.1f}s "
+              f"= {got_bytes / secs / (1024 * 1024):.2f} MB/s")
 
     ok = 0
-    for _, dest, size in jobs:
+    for _, dest, size in all_jobs:
         got = os.path.getsize(dest) if os.path.exists(dest) else 0
         good = got > 0 and (not size or got >= size)
         ok += good
         if not good:
             print(f"✗ incomplete: {dest} ({got}/{size or '?'} bytes)")
-    print(f"✅ {ok}/{len(jobs)} file(s) complete on Colab."
-          + ("  (re-run download_all() to resume failures)" if ok < len(jobs) else ""))
-    return rc == 0 and ok == len(jobs)
+    print(f"✅ {ok}/{len(all_jobs)} file(s) complete on Colab."
+          + ("  (re-run the same command to resume failures)" if ok < len(all_jobs) else ""))
+    return rc == 0 and ok == len(all_jobs)
 
 
 # ------------------------------------------------------------------- archive
